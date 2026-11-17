@@ -2,6 +2,8 @@
   "model": "base",
   "language": null,
   "remove_fillers": true,
-  "replacements": {}
+  "replacements": {},
+  "ai_cleanup": true,
+  "ai_model": "gemini-2.5-flash-lite"
 }
 
