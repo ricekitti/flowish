@@ -5,12 +5,14 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import json
+import os
 import queue
 import re
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from pathlib import Path
+from urllib import error, request
 
 import numpy as np
 import sounddevice as sd
@@ -40,7 +42,8 @@ user32.keybd_event.argtypes = (ctypes.c_ubyte, ctypes.c_ubyte, wintypes.DWORD, c
 
 
 def load_settings() -> dict:
-    defaults = {"model": "base", "language": None, "remove_fillers": True, "replacements": {}}
+    defaults = {"model": "base", "language": None, "remove_fillers": True,
+                "replacements": {}, "ai_cleanup": True, "ai_model": "gemini-2.5-flash-lite"}
     if SETTINGS_PATH.exists():
         try:
             incoming = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -64,19 +67,53 @@ def clean_text(text: str, settings: dict) -> str:
     return text[:1].upper() + text[1:] if text else text
 
 
+def ai_cleanup(text: str, api_key: str, model: str = "gemini-2.5-flash-lite") -> str:
+    """Send text only (never audio) to Gemini for conservative copy editing."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
+        raise ValueError("Invalid AI model name")
+    prompt = (
+        "Copy edit this speech transcript. Fix commas, punctuation, grammar, "
+        "capitalization, and obvious spelling errors. Remove filler words and "
+        "accidental repetitions. Preserve the speaker's meaning, language, "
+        "tone, names, and numbers. Do not answer questions or add information. "
+        "Return only a JSON object with one string field named text.\n\n"
+        f"Transcript:\n{text}"
+    )
+    payload = {"contents": [{"parts": [{"text": prompt}]}],
+               "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    req = request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                          headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                          method="POST")
+    try:
+        with request.urlopen(req, timeout=30) as response:
+            result = json.load(response)
+    except error.HTTPError as exc:
+        raise RuntimeError(f"Gemini returned HTTP {exc.code}") from exc
+    candidate = result["candidates"][0]
+    if candidate.get("finishReason") != "STOP":
+        raise RuntimeError("Gemini did not finish the edit")
+    output = "".join(part.get("text", "") for part in candidate["content"]["parts"])
+    edited = json.loads(output)["text"].strip()
+    if not edited or len(edited) > max(200, len(text) * 2):
+        raise RuntimeError("Gemini returned an invalid edit")
+    return edited
+
+
 class Flowish:
     def __init__(self) -> None:
         self.settings = load_settings()
         self.root = tk.Tk()
         self.root.title("Flowish")
-        self.root.geometry("500x330")
-        self.root.minsize(400, 280)
+        self.root.geometry("600x390")
+        self.root.minsize(560, 340)
         self.events: queue.Queue[tuple] = queue.Queue()
         self.frames: list[np.ndarray] = []
         self.stream = None
         self.recording = False
         self.busy = False
         self.model = None
+        self.api_key = os.environ.get("GEMINI_API_KEY", "")
         self.hotkey_thread_id = None
         self.closed = False
         self._build_ui()
@@ -94,6 +131,13 @@ class Flowish:
         ttk.Label(outer, textvariable=self.status).pack(anchor="w")
         self.button = ttk.Button(outer, text="Start recording", command=lambda: self.toggle(False), state="disabled")
         self.button.pack(anchor="w", pady=12)
+        self.ai_enabled = tk.BooleanVar(value=bool(self.settings.get("ai_cleanup") and self.api_key))
+        ai_label = "AI cleanup: grammar, spelling, punctuation (sends text to Google)"
+        self.ai_switch = ttk.Checkbutton(outer, text=ai_label, variable=self.ai_enabled)
+        self.ai_switch.pack(anchor="w", pady=(0, 6))
+        if not self.api_key:
+            self.ai_switch.configure(state="disabled")
+            ttk.Label(outer, text="Set GEMINI_API_KEY and restart to enable AI cleanup.").pack(anchor="w", pady=(0, 6))
         ttk.Label(outer, text="Last transcript").pack(anchor="w")
         self.transcript = tk.Text(outer, height=6, wrap="word")
         self.transcript.pack(fill="both", expand=True, pady=(5, 0))
@@ -138,7 +182,8 @@ class Flowish:
             self.busy = True
             self.button.configure(state="disabled", text="Transcribing…")
             self.status.set("Transcribing locally…")
-            threading.Thread(target=self._transcribe, args=(audio, paste), daemon=True).start()
+            threading.Thread(target=self._transcribe,
+                             args=(audio, paste, self.ai_enabled.get()), daemon=True).start()
         else:
             self.frames = []
             try:
@@ -152,14 +197,22 @@ class Flowish:
             self.status.set("Recording… press Ctrl+Alt+Space again to paste")
             self.button.configure(text="Stop recording")
 
-    def _transcribe(self, audio: np.ndarray, paste: bool) -> None:
+    def _transcribe(self, audio: np.ndarray, paste: bool, use_ai: bool) -> None:
         try:
             if len(audio) < SAMPLE_RATE // 4:
                 self.events.put(("result", "", paste))
                 return
             segments, _ = self.model.transcribe(audio, language=self.settings.get("language"), vad_filter=True)
             raw = " ".join(segment.text.strip() for segment in segments)
-            self.events.put(("result", clean_text(raw, self.settings), paste))
+            text = clean_text(raw, self.settings)
+            warning = None
+            if text and use_ai and self.api_key:
+                self.events.put(("status", "Improving grammar and punctuation…"))
+                try:
+                    text = ai_cleanup(text, self.api_key, self.settings.get("ai_model", "gemini-2.5-flash-lite"))
+                except (ValueError, KeyError, IndexError, OSError, RuntimeError) as exc:
+                    warning = f"AI cleanup unavailable ({exc}); pasted local transcript."
+            self.events.put(("result", text, paste, warning))
         except Exception as exc:
             self.events.put(("error", f"Transcription failed: {exc}"))
 
@@ -182,14 +235,17 @@ class Flowish:
                 elif event[0] == "hotkey":
                     self.toggle(True)
                 elif event[0] == "result":
-                    _, text, paste = event
+                    _, text, paste, *extra = event
+                    warning = extra[0] if extra else None
                     self.transcript.delete("1.0", "end")
                     self.transcript.insert("1.0", text)
                     if paste and text:
                         self._paste(text)
-                    self.status.set("Done." if text else "No speech detected.")
+                    self.status.set(warning or ("Done." if text else "No speech detected."))
                     self.busy = False
                     self.button.configure(state="normal", text="Start recording")
+                elif event[0] == "status":
+                    self.status.set(event[1])
                 elif event[0] == "error":
                     self.status.set(event[1])
                     self.busy = False
