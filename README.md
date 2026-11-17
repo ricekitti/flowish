@@ -1,6 +1,6 @@
 # Flowish
 
-A small Windows voice dictation app inspired by Wispr Flow's core workflow. Press **Ctrl+Alt+Space**, speak, press it again, and the transcript is pasted into the field that had focus. Transcription runs locally with faster-whisper. The speech model downloads on first use.
+A simple light weight windows dictation tool for taking notes or making chatgpt prompts.
 
 ## Run
 
